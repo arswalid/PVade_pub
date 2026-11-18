@@ -1,3 +1,17 @@
+"""Computational domain construction and mesh management.
+
+This module provides the :class:`FSIDomain` class, which orchestrates the
+entire geometry-to-mesh pipeline:
+
+1. Builds the CAD geometry by delegating to a problem-specific
+    ``DomainCreation`` module selected at runtime.
+2. Marks fluid and structural surface/volume regions with integer tags.
+3. Generates the mesh with Gmsh.
+4. Distributes the mesh across MPI ranks via DOLFINx.
+5. Extracts fluid and structure submeshes from the parent mesh using cell tags.
+6. Transfers facet tags to each submesh for boundary-condition assignment.
+"""
+
 import gmsh
 import numpy as np
 import os
@@ -10,14 +24,40 @@ import yaml
 from petsc4py import PETSc
 
 from importlib import import_module
+from pvade.IO.verbosity import emit_verbosity_print
 
 from numba import jit
 
 
+def _vprint(rank, message, level=1):
+    """Rank-0 verbosity-aware print helper for mesh manager messages."""
+    if rank == 0:
+        emit_verbosity_print(message, level=level)
+
+
 # from pvade.geometry.panels.DomainCreation   import *
 class FSIDomain:
-    """
-    This class creates the computational domain for 3D examples(3D panels, 3D cylinder)
+    """Fluid–structure interaction computational domain.
+
+    ``FSIDomain`` creates and manages the complete computational domain for
+    PVade simulations, including both the fluid mesh and the structure mesh.
+    It delegates geometry creation to a problem-specific ``DomainCreation``
+    module (e.g., ``pvade.geometry.panels3d.DomainCreation``) and provides
+    methods for mesh generation, submesh extraction, and I/O.
+
+    Attributes:
+        comm: MPI communicator shared by all PVade objects.
+        rank (int): Rank of this MPI process.
+        num_procs (int): Total number of MPI processes.
+        first_move_mesh (bool): Flag used by the ALE mesh-motion routines.
+        domain_markers (dict): Dictionary mapping boundary/cell region names to
+            their integer tag indices (``"idx"``), entity type (``"facet"`` or
+            ``"cell"``), and Gmsh tag lists.
+        numpy_pt_total_array (np.ndarray or None): Array of shape
+            ``(N_lines, 6)`` defining fixation line endpoints used to apply
+            torque-tube and motor-mount BCs.
+        ndim (int or None): Topological dimension of the mesh (set during
+            :meth:`build`).
     """
 
     def __init__(self, params):
@@ -44,6 +84,18 @@ class FSIDomain:
         self.ndim = None
 
     def _get_domain_markers(self, params):
+        """Initialise the ``domain_markers`` dictionary with default tags.
+
+        Populates ``self.domain_markers`` with integer indices for the
+        standard fluid facets (x_min, x_max, y_min, y_max, z_min, z_max,
+        internal_surface), cell regions (fluid, structure), and per-panel
+        facets (bottom, top, left, right, back, front) for panel and
+        heliostat cases, or cylinder surface tags for cylinder cases.
+
+        Args:
+            params (:obj:`pvade.IO.Parameters.SimParams`): A SimParams object
+                used to determine the geometry module and number of panels.
+        """
         self.domain_markers = {}
 
         # Fluid Facet Markers
@@ -129,6 +181,8 @@ class FSIDomain:
     def build(self, params):
         """This function call builds the geometry, marks the boundaries and creates a mesh using Gmsh."""
 
+        self.modeling_torque_tube = False
+
         domain_creation_module = (
             f"pvade.geometry.{params.general.geometry_module}.DomainCreation"
         )
@@ -151,6 +205,8 @@ class FSIDomain:
                 and params.general.structural_analysis == True
             ):
                 self.geometry.build_FSI(params)
+                self.modeling_torque_tube = self.geometry.modeling_torque_tube
+
             elif (
                 (
                     params.general.geometry_module == "panels3d"
@@ -160,8 +216,12 @@ class FSIDomain:
                 and params.general.structural_analysis == True
             ):
                 self.geometry.build_structure(params)
+                self.modeling_torque_tube = self.geometry.modeling_torque_tube
             else:
                 self.geometry.build_FSI(params)
+
+                self.modeling_torque_tube = False
+
             # Build the domain markers for each surface and cell
             if hasattr(self.geometry, "domain_markers"):
                 # If the "build" process created domain markers, use those directly...
@@ -186,6 +246,8 @@ class FSIDomain:
             self.ndim = (
                 self.geometry.ndim
             )  # gmsh_model.get_dimension() # ?? should this be domain.ndim?
+
+        self.modeling_torque_tube = self.comm.bcast(self.modeling_torque_tube, root=0)
 
         # When finished, rank 0 needs to tell other ranks about how the domain_markers dictionary was created
         # and what values it holds. This is important now since the number of indices "idx" generated in the
@@ -213,6 +275,11 @@ class FSIDomain:
         self.msh.name = "mesh_total"
         self.cell_tags.name = "cell_tags"
         self.facet_tags.name = "facet_tags"
+
+        with dolfinx.io.XDMFFile(self.comm, f"parent_mesh_only.xdmf", "w") as fp:
+            fp.write_mesh(self.msh)
+            fp.write_meshtags(self.cell_tags)
+            fp.write_meshtags(self.facet_tags)
 
         # if (
         #     params.general.geometry_module == "panels3d"
@@ -252,6 +319,17 @@ class FSIDomain:
             )
 
     def _save_submeshes_for_reload_hack(self, params):
+        """Write and immediately re-read the submesh files.
+
+        This round-trip write/read is a temporary workaround for DOLFINx mesh
+        transfer issues in parallel.  It calls :meth:`write_mesh_files`
+        followed by :meth:`read_mesh_files` to ensure each rank has a
+        consistent view of the submesh data.
+
+        Args:
+            params (:obj:`pvade.IO.Parameters.SimParams`): A SimParams object
+                providing the output directory path.
+        """
         self.write_mesh_files(params)
         self.read_mesh_files(params.general.output_dir_mesh, params)
 
@@ -272,14 +350,33 @@ class FSIDomain:
             submesh_list.append("structure")
 
         for sub_domain_name in submesh_list:
-            if self.rank == 0:
-                print(f"Creating {sub_domain_name} submesh")
+            _vprint(self.rank, f"Creating {sub_domain_name} submesh", level=1)
 
             # Get the idx associated with either "fluid" or "structure"
-            marker_id = self.domain_markers[sub_domain_name]["idx"]
 
-            # Find all cells where cell tag = marker_id
-            submesh_cells = self.cell_tags.find(marker_id)
+            # if structure includes modules and connectors
+            if (
+                sub_domain_name == "structure"
+                and "structure" not in self.domain_markers
+            ):
+                marker_id = self.domain_markers["modules"]["idx"]
+                # Find all cells where cell tag = marker_id
+                if (
+                    self.modeling_torque_tube
+                    and params.general.geometry_module == "panels3d"
+                ):
+                    submesh_cells_modules = self.cell_tags.find(marker_id)
+                    marker_id = self.domain_markers["connectors"]["idx"]
+                    submesh_cells = np.hstack(
+                        (self.cell_tags.find(marker_id), submesh_cells_modules)
+                    )
+                else:
+                    submesh_cells = self.cell_tags.find(marker_id)
+
+            else:
+                marker_id = self.domain_markers[sub_domain_name]["idx"]
+                # Find all cells where cell tag = marker_id
+                submesh_cells = self.cell_tags.find(marker_id)
 
             # Use those found cells to construct a new mesh
             submesh, entity_map, vertex_map, geom_map = dolfinx.mesh.create_submesh(
@@ -301,6 +398,17 @@ class FSIDomain:
             setattr(self, sub_domain_name, sub_domain)
 
     def _transfer_mesh_tags_to_submeshes(self, params):
+        """Transfer parent-mesh facet tags onto each submesh.
+
+        Iterates over the active submeshes (fluid and/or structure), maps the
+        parent facet tag values through the submesh entity map, and stores the
+        result as ``sub_domain.facet_tags`` and ``sub_domain.cell_tags`` on
+        each submesh object.
+
+        Args:
+            params (:obj:`pvade.IO.Parameters.SimParams`): A SimParams object
+                indicating which analyses are active.
+        """
         facet_dim = self.ndim - 1
 
         f_map = self.msh.topology.index_map(facet_dim)
@@ -309,7 +417,7 @@ class FSIDomain:
         num_facets = f_map.size_local + f_map.num_ghosts
         all_values = np.zeros(num_facets, dtype=np.int32)
 
-        # Assign non-zero facet tags using the facet tag indices
+        # Assign non-zero facet tags using the facet tag indices, save the facet marker to all_values
         all_values[self.facet_tags.indices] = self.facet_tags.values
 
         cell_to_facet = self.msh.topology.connectivity(self.ndim, facet_dim)
@@ -345,14 +453,29 @@ class FSIDomain:
                 for child, parent in zip(child_facets, parent_facets):
                     sub_values[child] = all_values[parent]
 
+            # sub_cell_map = sub_domain.msh.topology.index_map(self.ndim)
+            f_map_cell = self.msh.topology.index_map(self.ndim)
+
+            # Get the total number of cells in the parent mesh
+            num_cells = f_map_cell.size_local + f_map_cell.num_ghosts
+            all_cell_values = np.zeros(num_cells, dtype=np.int32)
+            all_cell_values[self.cell_tags.indices] = self.cell_tags.values
+
             sub_cell_map = sub_domain.msh.topology.index_map(self.ndim)
             sub_num_cells = sub_cell_map.size_local + sub_cell_map.num_ghosts
+
+            sub_cell_values = np.empty(sub_num_cells, dtype=np.int32)
+
+            for k, entity in enumerate(sub_domain.entity_map):
+                sub_cell_values[k] = all_cell_values[entity]
+
+            # sub_num_cells = sub_cell_map.size_local + sub_cell_map.num_ghosts
 
             sub_domain.cell_tags = dolfinx.mesh.meshtags(
                 sub_domain.msh,
                 sub_domain.msh.topology.dim,
                 np.arange(sub_num_cells, dtype=np.int32),
-                np.ones(sub_num_cells, dtype=np.int32),
+                sub_cell_values,
             )
             sub_domain.cell_tags.name = "cell_tags"
 
@@ -380,6 +503,17 @@ class FSIDomain:
             # sub_domain.facet_tags.name = "facet_tags"
 
     def _enforce_periodicity(self):
+        """Apply periodic mesh constraints in Gmsh.
+
+        Sets up front-back and left-right periodic mappings on the Gmsh model
+        using affine translation vectors so that the mesh generator produces
+        conforming periodic meshes.
+
+        .. note::
+            This method is only valid for the ``panels3d`` and similar
+            geometry modules that define ``dom_tags`` and ``y_span`` /
+            ``x_span`` attributes on the geometry object.
+        """
         # TODO: Make this a generic mapping depending on which walls are marked for peridic BCs
         # TODO: Copy code to enforce periodicity from old generate_and_convert_3d_meshes.py
 
@@ -433,7 +567,7 @@ class FSIDomain:
 
     def _generate_mesh(self):
         """This function call generates the mesh."""
-        print("Starting mesh generation... ", end="")
+        _vprint(self.rank, "Starting mesh generation...", level=1)
 
         # Generate the mesh
         tic = time.time()
@@ -445,11 +579,16 @@ class FSIDomain:
 
         toc = time.time()
 
-        if self.rank == 0:
-            print("Finished.")
-            print(f"Total meshing time = {toc-tic:.1f} s")
+        _vprint(self.rank, "Finished.", level=1)
+        _vprint(self.rank, f"Total meshing time = {toc-tic:.1f} s", level=1)
 
     def _generate_mesh_3d(self):
+        """Generate a 3-D mesh using Gmsh.
+
+        Applies Frontal-Delaunay 2-D and Delaunay 3-D meshing algorithms,
+        sets second-order element order, runs the ``Relocate3D`` optimiser,
+        and regenerates the mesh for improved element quality.
+        """
         # Mesh.Algorithm 2D mesh algorithm
         # (1: MeshAdapt, 2: Automatic, 3: Initial mesh only, 5: Delaunay, 6: Frontal-Delaunay, 7: BAMG, 8: Frontal-Delaunay for Quads, 9: Packing of Parallelograms)
         # Default value: 6
@@ -475,6 +614,11 @@ class FSIDomain:
         self.geometry.gmsh_model.mesh.generate(3)
 
     def _generate_mesh_2d(self):
+        """Generate a 2-D mesh using Gmsh.
+
+        Calls the Gmsh mesh generator for 2-D problems with default algorithm
+        settings.
+        """
         # Mesh.Algorithm 2D mesh algorithm
         # (1: MeshAdapt, 2: Automatic, 3: Initial mesh only, 5: Delaunay, 6: Frontal-Delaunay, 7: BAMG, 8: Frontal-Delaunay for Quads, 9: Packing of Parallelograms)
         # Default value: 6
@@ -491,22 +635,35 @@ class FSIDomain:
         self.geometry.gmsh_model.mesh.generate(2)
 
     def write_mesh_files(self, params):
+        """Write the fluid and structure submesh files to disk.
+
+        Saves each active submesh as an XDMF file (with cell and facet tag
+        arrays) and as a native Gmsh ``.msh`` file.  Also writes the
+        ``domain_markers`` dictionary to a YAML file and the fixation-point
+        array to a CSV file.
+
+        Args:
+            params (:obj:`pvade.IO.Parameters.SimParams`): A SimParams object
+                providing the mesh output directory path.
+        """
         # Attempt to save both the fluid and structure subdomains
         sub_domain_list = ["fluid", "structure"]
 
         for sub_domain_name in sub_domain_list:
             try:
-                if self.rank == 0:
-                    print(f"Beginning write of {sub_domain_name} mesh.")
+                _vprint(
+                    self.rank, f"Beginning write of {sub_domain_name} mesh.", level=1
+                )
 
                 # Get the fluid or structure object from self
                 sub_domain = getattr(self, sub_domain_name)
 
             except:
-                if self.rank == 0:
-                    print(
-                        f"Could not find subdomain {sub_domain_name}, not writing this mesh."
-                    )
+                _vprint(
+                    self.rank,
+                    f"Could not find subdomain {sub_domain_name}, not writing this mesh.",
+                    level=1,
+                )
 
             else:
                 # Write this subdomain mesh to a file
@@ -530,8 +687,7 @@ class FSIDomain:
                 )
                 gmsh.write(gmsh_mesh_filename)
 
-                if self.rank == 0:
-                    print(f"Finished writing {sub_domain_name} mesh.")
+                _vprint(self.rank, f"Finished writing {sub_domain_name} mesh.", level=1)
 
         # Finally, dump a yaml file of the domain_markers
         # necessary for setting BCs in case this mesh directory is read for a new run
@@ -555,6 +711,17 @@ class FSIDomain:
         and use it to solve the CFD/CSD problem
         """
 
+        if (
+            params.pv_array.torque_tube_separation > 0.0
+            and params.pv_array.torque_tube_outer_radius > 0.0
+        ):
+            self.modeling_torque_tube = True
+        else:
+            self.modeling_torque_tube = False
+            assert (
+                params.pv_array.modules_per_span == 1
+            ), "When not modeling torque tube, modules_per_span must be 1."
+
         sub_domain_list = ["fluid", "structure"]
 
         for sub_domain_name in sub_domain_list:
@@ -568,8 +735,7 @@ class FSIDomain:
                 and sub_domain_name == "structure"
             ):
                 try:
-                    if self.rank == 0:
-                        print(f"Reading {sub_domain_name} mesh.")
+                    _vprint(self.rank, f"Reading {sub_domain_name} mesh.", level=1)
 
                     # Read the subdomain mesh
                     with dolfinx.io.XDMFFile(self.comm, mesh_filename, "r") as xdmf:
@@ -580,10 +746,11 @@ class FSIDomain:
                         facet_tags = xdmf.read_meshtags(submesh, name="facet_tags")
 
                 except:
-                    if self.rank == 0:
-                        print(
-                            f"Could not find subdomain {sub_domain_name} mesh file, not reading this mesh."
-                        )
+                    _vprint(
+                        self.rank,
+                        f"Could not find subdomain {sub_domain_name} mesh file, not reading this mesh.",
+                        level=1,
+                    )
 
                 else:
 
@@ -645,8 +812,7 @@ class FSIDomain:
                         # assert np.all(self.fluid.msh.geometry.x[:] == self.fluid_undeformed.msh.geometry.x[:])
                         # assert np.shape(self.fluid.msh.geometry.x[:]) == np.shape(self.fluid_undeformed.msh.geometry.x[:])
 
-                if self.rank == 0:
-                    print(f"Finished read {sub_domain_name} mesh.")
+                _vprint(self.rank, f"Finished read {sub_domain_name} mesh.", level=1)
 
         self.ndim = submesh.topology.dim
 
@@ -711,9 +877,12 @@ class FSIDomain:
 
         coords = points[:]
 
-        print(f"Rank {self.rank} owns {num_nodes_owned_by_proc} nodes\n{coords}")
+        emit_verbosity_print(
+            f"Rank {self.rank} owns {num_nodes_owned_by_proc} nodes\n{coords}",
+            level=2,
+        )
 
-    def test_submesh_transfer(self, params):
+    def test_submesh_transfer(self, params, domain, elasticity):
         P2 = ufl.VectorElement("Lagrange", self.msh.ufl_cell(), 2)
         # P2 = ufl.FiniteElement("Lagrange", self.fluid.msh.ufl_cell(), 1)
 

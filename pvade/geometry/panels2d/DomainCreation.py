@@ -2,6 +2,13 @@ import gmsh
 import numpy as np
 
 from pvade.geometry.template.TemplateDomainCreation import TemplateDomainCreation
+from pvade.IO.verbosity import emit_verbosity_print
+
+
+def _vprint(rank, message, level=1):
+    """Rank-0 verbosity-aware print helper for geometry messages."""
+    if rank == 0:
+        emit_verbosity_print(message, level=level)
 
 
 class DomainCreation(TemplateDomainCreation):
@@ -184,22 +191,22 @@ class DomainCreation(TemplateDomainCreation):
 
                 if np.isclose(com[0], x_min_panel):
                     self._add_to_domain_markers(
-                        f"left_{panel_id:.0f}", [surf_id], "facet"
+                        f"panel_left_{panel_id:.0f}", [surf_id], "facet"
                     )
 
                 elif np.isclose(com[0], x_max_panel):
                     self._add_to_domain_markers(
-                        f"right_{panel_id:.0f}", [surf_id], "facet"
+                        f"panel_right_{panel_id:.0f}", [surf_id], "facet"
                     )
 
                 elif np.isclose(com[1], y_min_panel):
                     self._add_to_domain_markers(
-                        f"bottom_{panel_id:.0f}", [100], "facet"
+                        f"panel_bottom_{panel_id:.0f}_0", [surf_id], "facet"
                     )
 
                 elif np.isclose(com[1], y_max_panel):
                     self._add_to_domain_markers(
-                        f"top_{panel_id:.0f}", [surf_id], "facet"
+                        f"panel_top_{panel_id:.0f}_0", [surf_id], "facet"
                     )
 
             # Rotate the panel currently centered at
@@ -242,7 +249,7 @@ class DomainCreation(TemplateDomainCreation):
 
         # Tag objects as either structure or fluid
         vol_tag_list = self.gmsh_model.occ.getEntities(self.ndim)
-        print("vol_tag_list = ", vol_tag_list)
+        _vprint(self.rank, f"vol_tag_list = {vol_tag_list}", level=2)
         structure_vol_list = []
         fluid_vol_list = []
 
@@ -252,11 +259,11 @@ class DomainCreation(TemplateDomainCreation):
             if k < params.pv_array.stream_rows:
                 # Solid Cell
                 structure_vol_list.append(vol_id)
-                print("structure", vol_id)
+                _vprint(self.rank, f"structure {vol_id}", level=2)
             else:
                 # Fluid Cell
                 fluid_vol_list.append(vol_id)
-                print("fluid", vol_id)
+                _vprint(self.rank, f"fluid {vol_id}", level=2)
 
         self._add_to_domain_markers("structure", structure_vol_list, "cell")
         self._add_to_domain_markers("fluid", fluid_vol_list, "cell")
@@ -274,7 +281,7 @@ class DomainCreation(TemplateDomainCreation):
                     self.gmsh_model.addPhysicalGroup(
                         self.ndim, data["gmsh_tags"], data["idx"]
                     )
-                    print(f"Making {key} = {data['idx']}")
+                    _vprint(self.rank, f"Making {key} = {data['idx']}", level=2)
                     self.gmsh_model.setPhysicalName(self.ndim, data["idx"], key)
 
                 # Facets (i.e., entities of dim = msh.topology.dim - 1)

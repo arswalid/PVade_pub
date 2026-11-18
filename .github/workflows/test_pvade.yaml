@@ -5,7 +5,11 @@ on:
     branches: [ main ]
     # branches: [ main, dev ]
   pull_request:
-    branches: [ main, dev, sync]
+
+
+    branches: [ main, dev, sync, dev_wrap]
+
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -33,6 +37,8 @@ jobs:
         shell: bash -l {0}
         run: PYTHONPATH=. pytest -sv pvade/tests/
       - name: test all inputs
+        env:
+          OMPI_MCA_regx: "naive"
         shell: bash -l {0}
         run: pytest -sv  test_all_inputs.py 
 

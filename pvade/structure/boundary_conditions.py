@@ -1,9 +1,24 @@
+"""Boundary condition utilities for the structural mechanics solver.
+
+This module provides helper functions for identifying structural boundary
+entities and assembling Dirichlet boundary conditions on the structure mesh,
+including both surface-based BCs (fixed edges/faces) and line-based BCs
+(torque-tube and motor-mount connections along 1-D fixation lines).
+"""
+
 import dolfinx
 from petsc4py import PETSc
 
 import numpy as np
 
 import warnings
+from pvade.IO.verbosity import emit_verbosity_print
+
+
+def _vprint(rank, message, level=1):
+    """Rank-0 verbosity-aware print helper for structure BC messages."""
+    if rank == 0:
+        emit_verbosity_print(message, level=level)
 
 
 def get_facet_dofs_by_gmsh_tag(domain, functionspace, location):
@@ -55,8 +70,7 @@ def build_vel_bc_by_type(bc_type, domain, functionspace, bc_location):
         dolfinx.fem.dirichletbc: A dolfinx dirichlet boundary condition
     """
 
-    if domain.rank == 0:
-        print(f"Setting '{bc_type}' BC on {bc_location}")
+    _vprint(domain.rank, f"Setting '{bc_type}' BC on {bc_location}", level=1)
 
     if bc_type == "noslip":
         zero_vec = dolfinx.fem.Constant(
@@ -120,42 +134,29 @@ class InflowVelocity:
         inflow_dy = H - x[1]
         inflow_dz = H - x[2]
 
-        u_hub = self.params.fluid.u_ref
+        if self.params.fluid.velocity_profile_type == "specified_from_file":
+            u_hub = self.u_ref
+        else:
+            u_hub = self.params.fluid.u_ref
+
         z_hub = self.params.pv_array.elevation
 
         if self.params.general.example == "cylinder3d":
-            inflow_values[0] = (
-                16.0
-                * self.params.fluid.u_ref
-                * x[1]
-                * x[2]
-                * inflow_dy
-                * inflow_dz
-                / H**4
-            )
+            inflow_values[0] = 16.0 * u_hub * x[1] * x[2] * inflow_dy * inflow_dz / H**4
         elif self.params.general.example == "cylinder2d":
             inflow_values[0] = (
-                4
-                * (self.params.fluid.u_ref)
-                * np.sin(np.pi / 8)
-                * x[1]
-                * (0.41 - x[1])
-                / (0.41**2)
+                4 * (u_hub) * np.sin(np.pi / 8) * x[1] * (0.41 - x[1]) / (0.41**2)
             )
         elif (
             self.params.general.example == "panels3d"
             or self.params.general.example == "heliostats3d"
         ):
             inflow_values[0] = (
-                (self.params.fluid.u_ref)
-                * np.log(((x[2]) - d0) / z0)
-                / (np.log((z_hub - d0) / z0))
+                (u_hub) * np.log(((x[2]) - d0) / z0) / (np.log((z_hub - d0) / z0))
             )
         elif self.params.general.example == "panels2d":
             inflow_values[0] = (
-                (self.params.fluid.u_ref)
-                * np.log(((x[1]) - d0) / z0)
-                / (np.log((z_hub - d0) / z0))
+                (u_hub) * np.log(((x[1]) - d0) / z0) / (np.log((z_hub - d0) / z0))
             )
 
         return inflow_values
@@ -271,6 +272,25 @@ def build_pressure_boundary_conditions(domain, params, functionspace):
 
 
 def build_structure_boundary_conditions(domain, params, functionspace):
+    """Build all Dirichlet boundary conditions for the structure.
+
+    Applies zero-displacement constraints on all panel surface faces listed
+    in ``params.structure.bc_list``.  Optionally pins nodes along the torque
+    tube line (``params.structure.tube_connection``) and along motor-mount
+    lines (``params.structure.motor_connection``) using a collinearity test.
+
+    Args:
+        domain (:obj:`pvade.geometry.MeshManager.FSIDomain`): A Domain object
+            that holds the structure submesh and facet tags.
+        params (:obj:`pvade.IO.Parameters.SimParams`): A SimParams object
+            containing boundary condition settings and panel geometry.
+        functionspace (dolfinx.fem.FunctionSpace): The vector displacement
+            function space on which boundary conditions are applied.
+
+    Returns:
+        list[dolfinx.fem.DirichletBC]: A list of assembled Dirichlet boundary
+        condition objects ready to be passed to the nonlinear solver.
+    """
     facet_dim = domain.ndim - 1
     if domain.ndim == 2:
         zero_vec = dolfinx.fem.Constant(
@@ -285,8 +305,11 @@ def build_structure_boundary_conditions(domain, params, functionspace):
     total_num_panels = params.pv_array.stream_rows * params.pv_array.span_rows
 
     for num_panel in range(total_num_panels):
-        for location in params.structure.bc_list:
-            location_panel = f"{location}_{num_panel}"
+        for location in params.structure.bc_list:  # it is empty
+            if location == "panel_top" or location == "panel_bottom":
+                location_panel = f"{location}_{num_panel}_0"
+            else:
+                location_panel = f"{location}_{num_panel}"
             # f"front_{num_panel}" , f"back_{num_panel}":
             # for location in  [f"left_{num_panel}"]:# , f"right_{num_panel}":
             # for location in  f"left_{num_panel}":
@@ -357,43 +380,78 @@ def build_structure_boundary_conditions(domain, params, functionspace):
 
         return fn_handle
 
-    # Start pinning along the lines expressed byt numpy_pt_total_array
-    # First, determine the total number of rows (number of lines to pin)
-    num_nodes = np.shape(domain.numpy_pt_total_array)[0]
+    if domain.modeling_torque_tube and params.general.geometry_module == "panels3d":
+        # # Start pinning along the lines expressed byt numpy_pt_total_array
+        # The center line of connectors bottom surface is fixed to remove rigid body motion
 
-    # Determine how many pinning lines exist per each panel (e.g., 24 lines distributed on 8 panels means 3 lines per panel)
-    nodes_per_panel = int(num_nodes / total_num_panels)
+        if params.structure.tube_connection == True:
+            # If making torque tube connections, pass only those pinning lines to the BC identification function
+            tube_nodes = domain.numpy_pt_total_array[:, :]
 
-    # The torque tube entry (oriented spanwise along the middle, divides panel into upstream and downstream rectangular halves)
-    # is always the first entry, e.g., [0, ..., ..., 3, ..., ..., 6, ..., ...], [0, 3, 6] are the torque tubes
-    tube_nodes_idx = np.arange(0, num_nodes, nodes_per_panel, dtype=np.int64)
+            facet_uppoint = dolfinx.mesh.locate_entities(
+                domain.structure.msh, 1, connection_point_up_helper(tube_nodes)
+            )
+            dofs_disp = dolfinx.fem.locate_dofs_topological(
+                functionspace, 1, [facet_uppoint]
+            )
 
-    if params.structure.tube_connection == True:
-        # If making torque tube connections, pass only those pinning lines to the BC identification function
-        tube_nodes = domain.numpy_pt_total_array[tube_nodes_idx, :]
+            bc.append(dolfinx.fem.dirichletbc(zero_vec, dofs_disp, functionspace))
 
-        facet_uppoint = dolfinx.mesh.locate_entities(
-            domain.structure.msh, 1, connection_point_up_helper(tube_nodes)
-        )
-        dofs_disp = dolfinx.fem.locate_dofs_topological(
-            functionspace, 1, [facet_uppoint]
-        )
+        if params.structure.motor_connection == True:
+            # The bottom surface of the center connector is fixed to represent the motor mount
+            motor_location = (
+                params.pv_array.fixed_location
+            )  # fixed location along the span, if fixed_location=5, it means the left boundary of the 6th connector is fixed
+            for panel_id in range(total_num_panels):
 
-        bc.append(dolfinx.fem.dirichletbc(zero_vec, dofs_disp, functionspace))
+                mount_facet = domain.structure.facet_tags.find(
+                    domain.domain_markers[
+                        f"block_left_{panel_id:.0f}_{motor_location:.0f}"
+                    ]["idx"]
+                )
 
-    if params.structure.motor_connection == True:
-        # If making motor mount connections, pass only those pinning lines to the BC identification function
-        # this is done by making a copy of the numpy_pt_total_array with the torque tube lines *deleted*
-        # not done in place, so numpy_pt_total_array remains unaltered.
-        motor_nodes = np.delete(domain.numpy_pt_total_array, tube_nodes_idx, axis=0)
+                dofs_disp = dolfinx.fem.locate_dofs_topological(
+                    functionspace, 2, [mount_facet]
+                )
 
-        facet_uppoint = dolfinx.mesh.locate_entities(
-            domain.structure.msh, 1, connection_point_up_helper(motor_nodes)
-        )
-        dofs_disp = dolfinx.fem.locate_dofs_topological(
-            functionspace, 1, [facet_uppoint]
-        )
+                bc.append(dolfinx.fem.dirichletbc(zero_vec, dofs_disp, functionspace))
+    else:
+        # Start pinning along the lines expressed byt numpy_pt_total_array
+        # First, determine the total number of rows (number of lines to pin)
+        num_nodes = np.shape(domain.numpy_pt_total_array)[0]
 
-        bc.append(dolfinx.fem.dirichletbc(zero_vec, dofs_disp, functionspace))
+        # Determine how many pinning lines exist per each panel (e.g., 24 lines distributed on 8 panels means 3 lines per panel)
+        nodes_per_panel = int(num_nodes / total_num_panels)
 
+        # The torque tube entry (oriented spanwise along the middle, divides panel into upstream and downstream rectangular halves)
+        # is always the first entry, e.g., [0, ..., ..., 3, ..., ..., 6, ..., ...], [0, 3, 6] are the torque tubes
+        tube_nodes_idx = np.arange(0, num_nodes, nodes_per_panel, dtype=np.int64)
+
+        if params.structure.tube_connection == True:
+            # If making torque tube connections, pass only those pinning lines to the BC identification function
+            tube_nodes = domain.numpy_pt_total_array[tube_nodes_idx, :]
+
+            facet_uppoint = dolfinx.mesh.locate_entities(
+                domain.structure.msh, 1, connection_point_up_helper(tube_nodes)
+            )
+            dofs_disp = dolfinx.fem.locate_dofs_topological(
+                functionspace, 1, [facet_uppoint]
+            )
+
+            bc.append(dolfinx.fem.dirichletbc(zero_vec, dofs_disp, functionspace))
+
+        if params.structure.motor_connection == True:
+            # If making motor mount connections, pass only those pinning lines to the BC identification function
+            # this is done by making a copy of the numpy_pt_total_array with the torque tube lines *deleted*
+            # not done in place, so numpy_pt_total_array remains unaltered.
+            motor_nodes = np.delete(domain.numpy_pt_total_array, tube_nodes_idx, axis=0)
+
+            facet_uppoint = dolfinx.mesh.locate_entities(
+                domain.structure.msh, 1, connection_point_up_helper(motor_nodes)
+            )
+            dofs_disp = dolfinx.fem.locate_dofs_topological(
+                functionspace, 1, [facet_uppoint]
+            )
+
+            bc.append(dolfinx.fem.dirichletbc(zero_vec, dofs_disp, functionspace))
     return bc
